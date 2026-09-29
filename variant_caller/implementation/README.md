@@ -9,7 +9,7 @@ BAM ──bam_prep──> sorted+indexed BAM
 per tile (parallel):
     ──evidence───> count / strand / quality matrices over the tile (+110 bp margin)
     ──candidates─> candidate rows for the tile core
-    ──examples───> (n, 21 features, 221 bp) centred on each candidate -> shard .npy
+    ──examples───> (n, 30 features, 221 bp) centred on each candidate -> shard .npy
     ──truth──────> label = alt allele count at that POS (with --truth)
 after all tiles:
     ──windows────> windows.bed; each example tagged with its window_id
@@ -46,6 +46,6 @@ for every truth variant without a candidate at its POS.
 Coordinates: `candidates.tsv` `pos` is 1-based; `windows.bed` is 0-based half-open.
 
 Examples: `X, meta = candidates.examples.load_examples("out/")` gives a
-memory-mapped float16 array `(n, 21, 221)` and its metadata table. The
+memory-mapped float16 array `(n, 30, 221)` and its metadata table. The
 candidate is column 110; feature names are in `out/examples.json` and are
 documented at the top of `candidates/examples.py`.

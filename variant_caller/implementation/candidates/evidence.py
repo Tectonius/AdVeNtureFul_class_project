@@ -9,9 +9,9 @@ For a tile [start, end) we build, for every reference position:
       DEL_AFTER       a deletion starts right after this base
   rev_counts[...]           the same, from reverse-strand reads only
   sums[channel, offset]     running totals used for per-position means
-      BQ_SUM          base qualities of the counted bases
-      MAPQ_SUM        mapping qualities of the reads covering the base
-                      (divide by mapq_depth, which also counts low-BQ bases)
+      BQ_SUM + b      base qualities of the bases b (A, C, G, T, N) seen here
+      MAPQ_SUM + b    mapping qualities of the reads showing base b here
+                      (divide either by counts[b] for a per-base mean)
       INS_LEN_SUM     lengths of the insertions anchored here
       DEL_LEN_SUM     lengths of the deletions anchored here
 
@@ -45,8 +45,11 @@ CHANNEL_NAMES = ["A", "C", "G", "T", "N", "DEL_SPAN", "INS_AFTER", "DEL_AFTER"]
 BASES = "ACGTN"
 
 # Rows of the sums matrix.
-BQ_SUM, MAPQ_SUM, INS_LEN_SUM, DEL_LEN_SUM = range(4)
-N_SUMS = 4
+BQ_SUM = 0          # rows 0-4: base quality sums for A, C, G, T, N
+MAPQ_SUM = 5        # rows 5-9: mapping quality sums for A, C, G, T, N
+INS_LEN_SUM = 10
+DEL_LEN_SUM = 11
+N_SUMS = 12
 
 # ASCII byte -> base channel (anything unexpected counts as N).
 BASE_CODE = np.full(256, N, dtype=np.int64)
@@ -129,7 +132,7 @@ class TileEvidence:
     """All per-position evidence for reference positions [start, end) of one contig."""
 
     def __init__(self, contig, start, end, counts, rev_counts, sums,
-                 indel_events, ref_codes, indel_stats, mapq_depth):
+                 indel_events, ref_codes, indel_stats):
         self.contig = contig
         self.start = start
         self.end = end
@@ -139,7 +142,6 @@ class TileEvidence:
         self.indel_events = indel_events  # (n, 3) int: offset, is_insertion, length
         self.ref_codes = ref_codes      # reference base code per position
         self.indel_stats = indel_stats  # {"indels": n, "shifted": n}
-        self.mapq_depth = mapq_depth    # reads counted in MAPQ_SUM (incl. low-BQ bases)
 
     @property
     def base_counts(self):
@@ -206,23 +208,7 @@ class _TileAccumulator:
         self.counts = _Tally(2 * N_CHANNELS, tile_len)  # rows 0-7 forward, 8-15 reverse
         self.sums = _Tally(N_SUMS, tile_len, weighted=True)
         self.indel_events = []                          # (offset, is_insertion, length)
-        self.segments = []                              # (lo, hi, mapq) covered ref spans
         self.stats = {"indels": 0, "shifted": 0}
-
-
-def _segment_sums(segments, tile_len):
-    """Per-position (sum of MAPQ, number of reads) over covered [lo, hi) spans.
-
-    Uses difference arrays: +value at lo, -value at hi, then a running sum.
-    That costs two entries per alignment block instead of one per base.
-    """
-    if not segments:
-        return np.zeros(tile_len), np.zeros(tile_len)
-    lo, hi, mapq = np.asarray(segments, dtype=np.int64).T
-    size = tile_len + 1
-    mapq_diff = np.bincount(lo, mapq, size) - np.bincount(hi, mapq, size)
-    read_diff = np.bincount(lo, minlength=size) - np.bincount(hi, minlength=size)
-    return np.cumsum(mapq_diff)[:tile_len], np.cumsum(read_diff)[:tile_len]
 
 
 def read_passes_filters(read, config):
@@ -235,78 +221,138 @@ def read_passes_filters(read, config):
 
 def add_read(read, tile_start, tile_end, ref, acc, config):
     """Record every observation `read` makes inside [tile_start, tile_end)."""
+    # Tile length: the width of every row in the flat count/sum arrays.
     L = acc.tile_len
+    # Reverse-strand reads write to rows 8-15 of the counts tally, forward reads to rows 0-7.
     strand = N_CHANNELS if read.is_reverse else 0   # row offset into the counts tally
+    # Mapping quality is one number for the whole read; it is summed per base below.
     mapq = read.mapping_quality
+    # The read's bases as a string (needed by the insertion left-shifting, which compares letters).
     read_seq = read.query_sequence
+    # The same bases as numpy codes A=0, C=1, G=2, T=3, N=4, so they can index channel rows.
     seq = encode_sequence(read_seq)
+    # Per-base Phred qualities (None when the BAM stores '*' for qualities).
     quals = read.query_qualities
+    # Use a numpy array; without qualities, pretend every base is Q255 so none are filtered out.
     quals = np.asarray(quals) if quals is not None else np.full(len(seq), 255)
 
+    # Helper: trim a reference interval [lo, hi) to the part that lies inside this tile.
     def clip(lo, hi):
+        # Start no earlier than the tile start, end no later than the tile end.
         return max(lo, tile_start), min(hi, tile_end)
 
+    # Helper: store one indel event, if its (left-shifted) anchor falls inside this tile.
     def record_indel(channel, is_insertion, length, original, shifted):
         # Anchors only move left, so indels that start left of the tile, or
         # that could never slide back into it, are someone else's.
         if tile_start <= shifted < tile_end:
+            # Position of the anchor base relative to the tile start (column index).
             offset = shifted - tile_start
+            # Flat index for the INS_AFTER / DEL_AFTER count on this strand; added in bulk at the end.
             indel_anchors.append((channel + strand) * L + offset)
+            # Keep the event itself so candidates can report the most common indel length.
             acc.indel_events.append((offset, is_insertion, length))
+            # Count every indel recorded, for the run summary.
             acc.stats["indels"] += 1
+            # Also count how many were moved by left-alignment (True adds 1, False adds 0).
             acc.stats["shifted"] += shifted != original
 
+    # Flat indices of this read's indel anchors, collected here and tallied once after the loop.
     indel_anchors = []  # flat indices for INS_AFTER / DEL_AFTER
+    # Current reference position (0-based); starts at the first aligned base of the read.
     ref_pos = read.reference_start
+    # Current position within the read sequence (soft-clipped bases included, as in SAM).
     q_pos = 0
+    # How many aligned bases come directly before the current position: the furthest an indel may slide left.
     aligned_run = 0     # aligned bases directly before the current position
 
+    # Walk the CIGAR one operation at a time: (operation code, number of bases).
     for op, length in read.cigartuples:
+        # M / = / X: bases aligned to the reference, one read base per reference base.
         if op in ALIGNED_OPS:
+            # Reference interval covered by this block, trimmed to the tile.
             lo, hi = clip(ref_pos, ref_pos + length)
+            # Skip the counting if none of the block lies inside the tile.
             if lo < hi:
+                # Read position of the first in-tile base (skip bases before the tile start).
                 q_lo = q_pos + (lo - ref_pos)
+                # Base codes of the in-tile part of the block.
                 bases = seq[q_lo:q_lo + (hi - lo)]
+                # Base qualities of those same bases.
                 bq = quals[q_lo:q_lo + (hi - lo)]
+                # Mask: keep only bases at or above the minimum base quality.
                 good = bq >= config.min_base_quality
+                # Tile column of each kept base.
                 offsets = np.arange(lo - tile_start, hi - tile_start)[good]
-                acc.counts.add((bases[good] + strand) * L + offsets)
-                acc.sums.add(BQ_SUM * L + offsets, bq[good])
-                acc.segments.append((lo - tile_start, hi - tile_start, mapq))
+                # Base codes of the kept bases (0-4, which is also their channel row).
+                good_bases = bases[good]
+                # +1 to channel (base, this strand) at each column: the A/C/G/T/N counts.
+                acc.counts.add((good_bases + strand) * L + offsets)
+                # Add each base's quality to the BQ sum row for that base (for mean_bq_A..T).
+                acc.sums.add((BQ_SUM + good_bases) * L + offsets, bq[good])
+                # Add the read's MAPQ to the MAPQ sum row for that base (for mean_mapq_A..T).
+                acc.sums.add((MAPQ_SUM + good_bases) * L + offsets, mapq)
+            # Aligned blocks consume reference bases...
             ref_pos += length
+            # ...and read bases.
             q_pos += length
+            # These bases are available for a following indel to slide back over.
             aligned_run += length
 
+        # I / D: an insertion (extra read bases) or a deletion (missing reference bases).
         elif op in (CIGAR_INS, CIGAR_DEL):
+            # Indels are attached to the reference base just before them (the VCF POS convention).
             anchor = ref_pos - 1
+            # How far left it may slide: back over the preceding aligned block, or not at all if disabled.
             max_shift = aligned_run if config.left_align_indels else 0
+            # Only bother shifting if the result could land in the tile (it can only move left).
             if tile_start <= anchor and anchor - max_shift < tile_end:
+                # Insertion: compare read bases to find the leftmost equivalent placement.
                 if op == CIGAR_INS:
+                    # q_pos is the first inserted base in the read.
                     shifted = left_align_insertion(read_seq, q_pos, length, anchor, max_shift)
+                    # Record it under the INS_AFTER channel (is_insertion = 1).
                     record_indel(INS_AFTER, 1, length, anchor, shifted)
+                # Deletion: compare reference bases to find the leftmost equivalent placement.
                 else:
+                    # Uses the reference window, since the deleted bases are not in the read.
                     shifted = left_align_deletion(ref, anchor, length, max_shift)
+                    # Record it under the DEL_AFTER channel (is_insertion = 0).
                     record_indel(DEL_AFTER, 0, length, anchor, shifted)
 
+            # Advance the positions: this part follows the aligner's CIGAR, not the shifted anchor.
             if op == CIGAR_INS:
+                # Insertions consume read bases only; the reference position stays put.
                 q_pos += length
+            # Deletions consume reference bases only.
             else:
+                # Reference bases removed by the deletion, trimmed to the tile.
                 lo, hi = clip(ref_pos, ref_pos + length)
+                # Skip if the deletion lies entirely outside the tile.
                 if lo < hi:
+                    # Tile columns of the deleted bases.
                     offsets = np.arange(lo - tile_start, hi - tile_start)
+                    # +1 DEL_SPAN at each deleted base, so the read still counts towards depth there.
                     acc.counts.add((DEL_SPAN + strand) * L + offsets)
-                    acc.segments.append((lo - tile_start, hi - tile_start, mapq))
+                # Move past the deleted reference bases (no read bases are consumed).
                 ref_pos += length
+            # An indel breaks the aligned block, so the next indel cannot slide back past this one.
             aligned_run = 0
 
+        # N: skipped reference region (spliced RNA alignments); not expected in DNA reads.
         elif op == CIGAR_SKIP:
+            # Jump over the skipped reference bases without counting anything.
             ref_pos += length
+            # Nothing is aligned across a skip, so reset the slide limit.
             aligned_run = 0
 
+        # S: soft-clipped read bases, present in the sequence but not aligned.
         elif op == CIGAR_SOFT:
+            # Step past them in the read; the reference position does not move.
             q_pos += length
         # hard clips (5) and padding (6) consume nothing
 
+    # Add all of this read's INS_AFTER / DEL_AFTER counts in one call.
     acc.counts.add(np.asarray(indel_anchors, dtype=np.int64))
 
 
@@ -333,9 +379,8 @@ def collect_tile_evidence(bam, fasta, contig, start, end, config):
     L = end - start
     sums[INS_LEN_SUM] = np.bincount(offsets[is_ins == 1], lengths[is_ins == 1], minlength=L)
     sums[DEL_LEN_SUM] = np.bincount(offsets[is_ins == 0], lengths[is_ins == 0], minlength=L)
-    sums[MAPQ_SUM], mapq_depth = _segment_sums(acc.segments, L)
     return TileEvidence(
-        contig, start, end, mapq_depth=mapq_depth,
+        contig, start, end,
         counts=by_strand[:N_CHANNELS] + rev_counts,
         rev_counts=rev_counts,
         sums=sums,

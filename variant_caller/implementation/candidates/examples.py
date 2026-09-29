@@ -11,12 +11,18 @@ examples from 35x and 48x data look alike.
     frac_del_span         fraction of depth with this base deleted
     frac_ins_after        fraction of depth with an insertion after this base
     frac_del_after        fraction of depth with a deletion after this base
+    frac_ref              fraction of depth showing the reference base
+    frac_best_alt_base    largest fraction among the three non-reference bases
+    best_alt_fraction     max(frac_best_alt_base, frac_ins_after, frac_del_after):
+                          the strongest variant signal of any kind
     rev_frac_depth        fraction of depth from reverse-strand reads
     rev_frac_nonref       ... of the non-reference bases (0.5 if none)
     rev_frac_ins          ... of the insertions (0.5 if none)
     rev_frac_del          ... of the deletions (0.5 if none)
-    mean_bq               mean base quality / 60, capped at 1
-    mean_mapq             mean mapping quality / 60, capped at 1
+    mean_bq_A .. _T       mean base quality of the reads showing that base,
+                          / 60, capped at 1 (0 if no read shows it)
+    mean_mapq_A .. _T     mean mapping quality of the reads showing that base,
+                          / 60, capped at 1 (0 if no read shows it)
     mean_ins_len          mean insertion length here / 50, capped at 1
     mean_del_len          mean deletion length here / 50, capped at 1
 
@@ -26,15 +32,18 @@ Positions outside the contig are all zeros.
 import numpy as np
 
 from .evidence import (A, BQ_SUM, DEL_AFTER, DEL_LEN_SUM, DEL_SPAN, INS_AFTER,
-                       INS_LEN_SUM, MAPQ_SUM, N, T)
+                       INS_LEN_SUM, MAPQ_SUM, N)
 
 FEATURE_NAMES = [
     "ref_A", "ref_C", "ref_G", "ref_T",
     "depth_norm",
     "frac_A", "frac_C", "frac_G", "frac_T", "frac_N",
     "frac_del_span", "frac_ins_after", "frac_del_after",
+    "frac_ref", "frac_best_alt_base", "best_alt_fraction",
     "rev_frac_depth", "rev_frac_nonref", "rev_frac_ins", "rev_frac_del",
-    "mean_bq", "mean_mapq", "mean_ins_len", "mean_del_len",
+    "mean_bq_A", "mean_bq_C", "mean_bq_G", "mean_bq_T",
+    "mean_mapq_A", "mean_mapq_C", "mean_mapq_G", "mean_mapq_T",
+    "mean_ins_len", "mean_del_len",
 ]
 N_FEATURES = len(FEATURE_NAMES)
 EXAMPLE_DTYPE = np.float16
@@ -60,6 +69,12 @@ def feature_matrix(evidence):
     known = evidence.ref_codes < N
     ref_onehot[evidence.ref_codes[known], np.flatnonzero(known)] = 1.0
 
+    # Reference-relative view: zero out the reference base, keep the best other base.
+    alt_counts = counts[A:N].copy()
+    alt_counts[evidence.ref_codes[known], np.flatnonzero(known)] = 0
+    frac_best_alt_base = _ratio(alt_counts.max(axis=0), depth)
+    frac_ins, frac_del = _ratio(counts[INS_AFTER], depth), _ratio(counts[DEL_AFTER], depth)
+
     nonref = base_depth - counts[N] - evidence.ref_counts
     rev_nonref = rev[A:N + 1].sum(axis=0) - rev[N] - evidence.rev_ref_counts
 
@@ -68,14 +83,17 @@ def feature_matrix(evidence):
         depth / mean_depth,
         *(_ratio(counts[b], depth) for b in range(A, N + 1)),
         _ratio(counts[DEL_SPAN], depth),
-        _ratio(counts[INS_AFTER], depth),
-        _ratio(counts[DEL_AFTER], depth),
+        frac_ins,
+        frac_del,
+        _ratio(evidence.ref_counts, depth),
+        frac_best_alt_base,
+        np.maximum.reduce([frac_best_alt_base, frac_ins, frac_del]),
         _ratio(rev_depth, depth),
         _ratio(rev_nonref, nonref, empty=0.5),
         _ratio(rev[INS_AFTER], counts[INS_AFTER], empty=0.5),
         _ratio(rev[DEL_AFTER], counts[DEL_AFTER], empty=0.5),
-        np.minimum(_ratio(evidence.sums[BQ_SUM], base_depth) / 60, 1),
-        np.minimum(_ratio(evidence.sums[MAPQ_SUM], evidence.mapq_depth) / 60, 1),
+        *(np.minimum(_ratio(evidence.sums[BQ_SUM + b], counts[b]) / 60, 1) for b in range(A, N)),
+        *(np.minimum(_ratio(evidence.sums[MAPQ_SUM + b], counts[b]) / 60, 1) for b in range(A, N)),
         np.minimum(_ratio(evidence.sums[INS_LEN_SUM], counts[INS_AFTER]) / 50, 1),
         np.minimum(_ratio(evidence.sums[DEL_LEN_SUM], counts[DEL_AFTER]) / 50, 1),
     ]
