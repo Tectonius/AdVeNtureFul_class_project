@@ -216,3 +216,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Project data (large reference / BAM / truth files, symlinked from shared storage)
+data/
